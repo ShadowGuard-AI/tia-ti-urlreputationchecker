@@ -19,6 +19,7 @@ VIRUSTOTAL_API_KEY = os.environ.get("VIRUSTOTAL_API_KEY")
 URLSCANIO_API_KEY = os.environ.get("URLSCANIO_API_KEY")
 
 # Outcomes that mean a check was actually performed and answered.
+# Counting unknown and no_results as completed is a choice worth seeing in the open. A run where every service answered that it knows nothing about the URL still counts as a completed run in main and exits 0, so the exit code says the check ran, never that a verdict was found.
 COMPLETED_OUTCOMES = ("ok", "unknown", "no_results")
 
 
@@ -59,6 +60,7 @@ def is_valid_url(url):
 
 def virustotal_url_id(url):
     """The VirusTotal v3 identifier for a URL: base64 urlsafe, no padding."""
+    # I encode the URL string exactly as it was typed. A trailing slash, a different scheme case, or a default port written out longhand all produce a different id, so a lookup can miss a URL that VirusTotal holds under a slightly different spelling of the same address.
     return base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
 
 
@@ -86,6 +88,7 @@ def check_virustotal(url, timeout=30):
         logging.error(f"Request to VirusTotal failed: {e}")
         return "error", None
 
+    # A 404 from this endpoint is information, not a failure: the service has simply never seen the URL. I keep it apart from a 401 or a 500 because the fix differs, one needs a key or a retry, the other needs the URL submitted somewhere first.
     if response.status_code == 404:
         logging.info(f"URL unknown to VirusTotal: {url}")
         return "unknown", None
@@ -115,6 +118,7 @@ def check_urlscanio_search(url, timeout=30):
     try:
         response = requests.get(
             "https://urlscan.io/api/v1/search/",
+            # The search asks for an exact page URL match. A scan of the same page reached with a query string, or through a redirect, sits under a different page.url value and does not appear in these results, so no_results is narrower than it sounds.
             headers=headers, params={"q": f'page.url:"{url}"'}, timeout=timeout)
     except requests.exceptions.RequestException as e:
         logging.error(f"Request to URLScan.io search failed: {e}")
@@ -165,6 +169,7 @@ def check_urlscanio_submit(url, timeout=30, wait_seconds=60, poll_interval=5):
         logging.error(f"Failed to decode JSON response from URLScan.io: {e}")
         return "error", None
 
+    # I take the uuid field first and only dig the id out of the result URL when that field is missing. The service has returned both shapes, and guessing wrong here would poll a nonsense address until the deadline ran out.
     scan_id = scan_result.get("uuid")
     if not scan_id:
         result_value = scan_result.get("result") or ""
@@ -174,6 +179,7 @@ def check_urlscanio_submit(url, timeout=30, wait_seconds=60, poll_interval=5):
         return "error", None
 
     result_url = f"https://urlscan.io/api/v1/result/{scan_id}"
+    # The deadline is only tested when a 404 comes back. Any other non 200 status ends the wait at once, even with time left, and a request already in flight can finish past the deadline because nothing interrupts it.
     deadline = time.monotonic() + wait_seconds
     while True:
         try:
@@ -212,6 +218,7 @@ def check_blacklist(url):
     Returns True only when the parsed hostname equals a listed host or
     is a subdomain of one. Loopback and lookalike names do not match.
     """
+    # Matching on the parsed hostname, lowered and with a trailing dot removed, is what keeps a lookalike name out. The old failure shape for this kind of check is a substring match, where a listed name hidden inside a longer host or a path would match, and that cannot happen here.
     host = (urlparse(url).hostname or "").lower().rstrip(".")
     if not host:
         return False
@@ -265,6 +272,7 @@ def main():
         results["check_status"]["urlscanio"] = outcome
         if outcome in COMPLETED_OUTCOMES:
             completed += 1
+    # Submit wins when both urlscan flags are passed, and the search is skipped without a word. That ordering is deliberate: a caller who asked for a fresh scan should not get stale search results and think they were new.
     elif args.urlscan:
         logging.info(f"Looking URL up on URLScan.io (no submission): {url}")
         outcome, payload = check_urlscanio_search(url, timeout=args.timeout)
